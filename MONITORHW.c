@@ -37,7 +37,7 @@
  *  como verificación cruzada del dashboard que calcula monitor.sh.
  *
  *  Compilar:
- *    gcc -o MONITORHW MONITORHW.c -lpthread
+ *    gcc -o monitor_hw MONITORHW.c -lpthread
  *
  *  Ejecutar:
  *    ./MONITORHW
