@@ -40,7 +40,7 @@
  *    gcc -o monitor_hw MONITORHW.c -lpthread
  *
  *  Ejecutar:
- *    ./MONITORHW
+ *    ./monitor_hw
  * =============================================================
  */
  
