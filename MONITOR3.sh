@@ -3,7 +3,7 @@
 #  PROYECTO FASE 3 - SISTEMAS OPERATIVOS
 #  Universidad Católica de Santa María
 # -----------------------------------------------------------------
-#  Archivo : monitor.sh
+#  Archivo : MONITOR3.sh
 #  Autor   : Rojas Luna Kevin Jostin (2023803011)
 #  Avance  : 100% - Script Bash principal (versión final)
 # -----------------------------------------------------------------
@@ -17,8 +17,8 @@
 #    - NUEVO (100%): Rotación automática de logs por número de líneas
 #
 #  Ejecutar:
-#    chmod +x monitor.sh
-#    ./monitor.sh
+#    chmod +x MONITOR3.sh
+#    ./MONITOR3.sh
 #
 #  Enviar señales desde otra terminal:
 #    kill -SIGUSR1 <PID>   # volcar resumen (historial + procesos)
