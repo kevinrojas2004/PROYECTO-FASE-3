@@ -4,7 +4,7 @@
  *  Universidad Católica de Santa María
  *  Escuela Profesional de Ingeniería de Sistemas
  * -------------------------------------------------------------
- *  Archivo   : monitor_hw.c
+ *  Archivo   : MONITORHW.c
  *  Autor     : Rojas Luna Kevin Jostin (2023803011)
  *  Fecha     : 05/06/2026
  *  Avance    : 100% - Módulo C con hilos POSIX, mutex, señales
@@ -37,10 +37,10 @@
  *  como verificación cruzada del dashboard que calcula monitor.sh.
  *
  *  Compilar:
- *    gcc -o monitor_hw monitor_hw.c -lpthread
+ *    gcc -o MONITORHW MONITORHW.c -lpthread
  *
  *  Ejecutar:
- *    ./monitor_hw
+ *    ./MONITORHW
  * =============================================================
  */
  
