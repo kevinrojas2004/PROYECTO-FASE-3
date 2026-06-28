@@ -1,0 +1,426 @@
+/*
+ * =============================================================
+ *  PROYECTO FASE 3 - SISTEMAS OPERATIVOS
+ *  Universidad Católica de Santa María
+ *  Escuela Profesional de Ingeniería de Sistemas
+ * -------------------------------------------------------------
+ *  Archivo   : monitor_hw.c
+ *  Autor     : Rojas Luna Kevin Jostin (2023803011)
+ *  Fecha     : 05/06/2026
+ *  Avance    : 100% - Módulo C con hilos POSIX, mutex, señales
+ *              y estadísticas por hilo (versión final)
+ * -------------------------------------------------------------
+ *  Descripción:
+ *    Programa en C que crea 3 hilos concurrentes para monitorear
+ *    CPU, RAM y Disco en paralelo. Cada hilo escribe sus métricas
+ *    en un archivo de log compartido (/dev/shm/syslog_ipc.txt),
+ *    sincronizado mediante un mutex para evitar condiciones de carrera.
+ *
+ *  NUEVO (65%): Responde a señales SIGTERM/SIGINT enviadas desde
+ *  monitor.sh (o manualmente), permitiendo un cierre limpio de los
+ *  hilos sin esperar a que terminen sus iteraciones.
+ *
+ *  NUEVO (100%): Pausa y reanudación del monitoreo.
+ *  No se agregó código para esto. Se maneja con SIGSTOP/SIGCONT,
+ *  señales que el kernel entrega de forma especial: SIGSTOP no
+ *  puede ser interceptada, bloqueada ni ignorada por NINGÚN
+ *  proceso (a diferencia de SIGTERM). Cuando monitor.sh envía
+ *  SIGSTOP a este binario, el kernel congela TODO el proceso de
+ *  forma atómica -- los 3 hilos quedan suspendidos exactamente
+ *  donde estaban, incluso si uno de ellos tenía el mutex tomado.
+ *  Al llegar SIGCONT, cada hilo continúa desde ese mismo punto.
+ *  Por eso es seguro: nunca queda un hilo "congelado a medias"
+ *  dentro de la sección crítica mientras otro se ejecuta.
+ *
+ *  NUEVO (100%): Cada hilo ahora acumula sus propias lecturas
+ *  y reporta su promedio de sesión en el mensaje de cierre,
+ *  como verificación cruzada del dashboard que calcula monitor.sh.
+ *
+ *  Compilar:
+ *    gcc -o monitor_hw monitor_hw.c -lpthread
+ *
+ *  Ejecutar:
+ *    ./monitor_hw
+ * =============================================================
+ */
+ 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <signal.h>     /* NUEVO (65%): manejo de señales SIGTERM/SIGINT */
+ 
+/* ─── Constantes ─────────────────────────────────────────── */
+#define LOG_FILE      "/dev/shm/syslog_ipc.txt"
+#define INTERVALO_SEG  2      /* segundos entre cada lectura  */
+#define ITERACIONES   10      /* NUEVO (100%): antes eran 5. Se duplicó para
+                                  dar más margen de tiempo (~30s en vez de ~13s)
+                                  al probar los comandos desde la segunda
+                                  terminal (pausar, reanudar, mensaje, etc.) */
+ 
+/* ─── Mutex global ───────────────────────────────────────── */
+pthread_mutex_t mutex_log = PTHREAD_MUTEX_INITIALIZER;
+ 
+/* ───────────────────────────────────────────────────────────
+ * NUEVO (65%): Bandera global de terminación
+ * Es 'volatile sig_atomic_t' porque se modifica dentro de un
+ * manejador de señales y se lee desde los hilos: debe garantizar
+ * lectura/escritura atómica sin optimizaciones del compilador.
+ * ─────────────────────────────────────────────────────────── */
+volatile sig_atomic_t terminar_programa = 0;
+ 
+/* ================================================================
+ *  NUEVO (65%): MANEJADOR DE SEÑALES (Guía 8)
+ *  Captura SIGTERM y SIGINT (Ctrl+C) para iniciar un cierre
+ *  ordenado: activa la bandera que los hilos revisan en cada
+ *  iteración de su bucle for.
+ * ================================================================ */
+void manejador_senales(int signum) {
+    /* No usamos printf aquí: las funciones no "async-signal-safe"
+       dentro de un handler son riesgosas. Solo cambiamos la bandera. */
+    terminar_programa = 1;
+    (void)signum; /* evita warning de parámetro no usado */
+}
+ 
+/* ================================================================
+ *  UTILIDAD: obtener timestamp formateado
+ *  Formato: [YYYY-MM-DD HH:MM:SS]
+ * ================================================================ */
+void obtener_timestamp(char *buffer, size_t tam) {
+    time_t ahora = time(NULL);
+    struct tm *t = localtime(&ahora);
+    strftime(buffer, tam, "[%Y-%m-%d %H:%M:%S]", t);
+}
+ 
+/* ================================================================
+ *  UTILIDAD: escribir una línea en el log con mutex
+ * ================================================================ */
+void escribir_log(const char *nivel, const char *fuente, const char *mensaje) {
+    char timestamp[32];
+    obtener_timestamp(timestamp, sizeof(timestamp));
+ 
+    /* SECCIÓN CRÍTICA: solo un hilo escribe a la vez */
+    pthread_mutex_lock(&mutex_log);
+ 
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (fp != NULL) {
+        fprintf(fp, "%s [%s] [%s] %s\n", timestamp, nivel, fuente, mensaje);
+        fflush(fp);
+        fclose(fp);
+    } else {
+        /* Si no se puede abrir el log, imprimir en stderr */
+        fprintf(stderr, "ERROR: No se pudo abrir el archivo de log: %s\n", LOG_FILE);
+    }
+ 
+    /* Mostrar en consola también */
+    printf("%s [%s] [%s] %s\n", timestamp, nivel, fuente, mensaje);
+ 
+    pthread_mutex_unlock(&mutex_log);
+    /* FIN SECCIÓN CRÍTICA */
+}
+ 
+/* ================================================================
+ *  HILO 1 - Monitoreo de CPU
+ *  Lee el uso de CPU desde /proc/stat
+ * ================================================================ */
+void *hilo_cpu(void *arg) {
+    char mensaje[256];
+    unsigned long long user1, nice1, sys1, idle1, iowait1, irq1, sirq1;
+    unsigned long long user2, nice2, sys2, idle2, iowait2, irq2, sirq2;
+    double uso_cpu;
+    double suma_cpu = 0.0;     /* NUEVO (100%): acumulador para promedio de sesión */
+    int lecturas_validas = 0;  /* NUEVO (100%): cuántas lecturas se promediaron */
+ 
+    escribir_log("INFO", "HILO-CPU", "Hilo de monitoreo CPU iniciado");
+ 
+    for (int i = 0; i < ITERACIONES; i++) {
+ 
+        /* NUEVO (65%): revisa la bandera de señal antes de cada iteración */
+        if (terminar_programa) {
+            escribir_log("WARN", "HILO-CPU", "Cierre anticipado por señal recibida");
+            pthread_exit(NULL);
+        }
+ 
+        /* Primera lectura de /proc/stat */
+        FILE *fp1 = fopen("/proc/stat", "r");
+        if (fp1 == NULL) {
+            escribir_log("ERROR", "HILO-CPU", "No se pudo leer /proc/stat");
+            pthread_exit(NULL);
+        }
+        fscanf(fp1, "cpu %llu %llu %llu %llu %llu %llu %llu",
+               &user1, &nice1, &sys1, &idle1, &iowait1, &irq1, &sirq1);
+        fclose(fp1);
+ 
+        sleep(1); /* espera 1 segundo para calcular delta */
+ 
+        /* Segunda lectura */
+        FILE *fp2 = fopen("/proc/stat", "r");
+        if (fp2 == NULL) {
+            escribir_log("ERROR", "HILO-CPU", "No se pudo leer /proc/stat (segunda lectura)");
+            pthread_exit(NULL);
+        }
+        fscanf(fp2, "cpu %llu %llu %llu %llu %llu %llu %llu",
+               &user2, &nice2, &sys2, &idle2, &iowait2, &irq2, &sirq2);
+        fclose(fp2);
+ 
+        /* Cálculo del % de uso */
+        unsigned long long total1 = user1 + nice1 + sys1 + idle1 + iowait1 + irq1 + sirq1;
+        unsigned long long total2 = user2 + nice2 + sys2 + idle2 + iowait2 + irq2 + sirq2;
+        unsigned long long delta_total = total2 - total1;
+        unsigned long long delta_idle  = idle2  - idle1;
+ 
+        if (delta_total == 0) {
+            uso_cpu = 0.0;
+        } else {
+            uso_cpu = 100.0 * (1.0 - ((double)delta_idle / (double)delta_total));
+        }
+ 
+        /* Determinar nivel de alerta */
+        const char *nivel;
+        if (uso_cpu >= 80.0)      nivel = "WARN";
+        else if (uso_cpu >= 95.0) nivel = "ERROR";
+        else                       nivel = "INFO";
+ 
+        snprintf(mensaje, sizeof(mensaje),
+                 "Uso de CPU: %.2f%%  [iteracion %d/%d]",
+                 uso_cpu, i + 1, ITERACIONES);
+ 
+        escribir_log(nivel, "HILO-CPU", mensaje);
+ 
+        suma_cpu += uso_cpu;          /* NUEVO (100%) */
+        lecturas_validas++;           /* NUEVO (100%) */
+ 
+        sleep(INTERVALO_SEG);
+    }
+ 
+    /* NUEVO (100%): calcula y reporta el promedio de la sesión de este hilo */
+    {
+        double promedio = (lecturas_validas > 0) ? (suma_cpu / lecturas_validas) : 0.0;
+        snprintf(mensaje, sizeof(mensaje),
+                 "Hilo CPU finalizado correctamente. Promedio de sesion: %.2f%% (%d lecturas)",
+                 promedio, lecturas_validas);
+        escribir_log("INFO", "HILO-CPU", mensaje);
+    }
+    pthread_exit(NULL);
+}
+ 
+/* ================================================================
+ *  HILO 2 - Monitoreo de RAM
+ *  Lee MemTotal, MemAvailable desde /proc/meminfo
+ * ================================================================ */
+void *hilo_ram(void *arg) {
+    char mensaje[256];
+    char linea[128];
+    unsigned long long mem_total = 0, mem_disponible = 0;
+    double uso_ram, porcentaje_libre;
+    double suma_ram = 0.0;        /* NUEVO (100%): acumulador para promedio de sesión */
+    int lecturas_validas = 0;     /* NUEVO (100%) */
+ 
+    escribir_log("INFO", "HILO-RAM", "Hilo de monitoreo RAM iniciado");
+ 
+    for (int i = 0; i < ITERACIONES; i++) {
+ 
+        /* NUEVO (65%): revisa la bandera de señal antes de cada iteración */
+        if (terminar_programa) {
+            escribir_log("WARN", "HILO-RAM", "Cierre anticipado por señal recibida");
+            pthread_exit(NULL);
+        }
+ 
+        FILE *fp = fopen("/proc/meminfo", "r");
+        if (fp == NULL) {
+            escribir_log("ERROR", "HILO-RAM", "No se pudo leer /proc/meminfo");
+            pthread_exit(NULL);
+        }
+ 
+        /* Leer línea a línea buscando MemTotal y MemAvailable */
+        while (fgets(linea, sizeof(linea), fp)) {
+            if (strncmp(linea, "MemTotal:", 9) == 0)
+                sscanf(linea, "MemTotal: %llu kB", &mem_total);
+            if (strncmp(linea, "MemAvailable:", 13) == 0)
+                sscanf(linea, "MemAvailable: %llu kB", &mem_disponible);
+        }
+        fclose(fp);
+ 
+        if (mem_total == 0) {
+            escribir_log("ERROR", "HILO-RAM", "Datos de memoria no validos");
+            sleep(INTERVALO_SEG);
+            continue;
+        }
+ 
+        uso_ram        = (double)(mem_total - mem_disponible) / (double)mem_total * 100.0;
+        porcentaje_libre = 100.0 - uso_ram;
+ 
+        /* Nivel de alerta */
+        const char *nivel;
+        if (uso_ram >= 90.0)      nivel = "ERROR";
+        else if (uso_ram >= 75.0) nivel = "WARN";
+        else                       nivel = "INFO";
+ 
+        snprintf(mensaje, sizeof(mensaje),
+                 "RAM Total: %llu MB | Usada: %llu MB (%.2f%%) | Libre: %.2f%%",
+                 mem_total / 1024,
+                 (mem_total - mem_disponible) / 1024,
+                 uso_ram,
+                 porcentaje_libre);
+ 
+        escribir_log(nivel, "HILO-RAM", mensaje);
+ 
+        suma_ram += uso_ram;           /* NUEVO (100%) */
+        lecturas_validas++;            /* NUEVO (100%) */
+ 
+        sleep(INTERVALO_SEG);
+    }
+ 
+    /* NUEVO (100%): calcula y reporta el promedio de la sesión de este hilo */
+    {
+        double promedio = (lecturas_validas > 0) ? (suma_ram / lecturas_validas) : 0.0;
+        snprintf(mensaje, sizeof(mensaje),
+                 "Hilo RAM finalizado correctamente. Promedio de sesion: %.2f%% (%d lecturas)",
+                 promedio, lecturas_validas);
+        escribir_log("INFO", "HILO-RAM", mensaje);
+    }
+    pthread_exit(NULL);
+}
+ 
+/* ================================================================
+ *  HILO 3 - Monitoreo de Disco
+ *  Usa statvfs() para obtener espacio en /
+ * ================================================================ */
+#include <sys/statvfs.h>
+ 
+void *hilo_disco(void *arg) {
+    char mensaje[256];
+    struct statvfs stat;
+    double total_gb, libre_gb, usado_gb, porcentaje_uso;
+    double suma_disco = 0.0;      /* NUEVO (100%): acumulador para promedio de sesión */
+    int lecturas_validas = 0;     /* NUEVO (100%) */
+ 
+    escribir_log("INFO", "HILO-DISCO", "Hilo de monitoreo DISCO iniciado");
+ 
+    for (int i = 0; i < ITERACIONES; i++) {
+ 
+        /* NUEVO (65%): revisa la bandera de señal antes de cada iteración */
+        if (terminar_programa) {
+            escribir_log("WARN", "HILO-DISCO", "Cierre anticipado por señal recibida");
+            pthread_exit(NULL);
+        }
+ 
+        if (statvfs("/", &stat) != 0) {
+            escribir_log("ERROR", "HILO-DISCO", "No se pudo obtener info del disco con statvfs");
+            sleep(INTERVALO_SEG);
+            continue;
+        }
+ 
+        /* Calcular en GB */
+        unsigned long long block_size = stat.f_frsize;
+        total_gb = (double)(stat.f_blocks * block_size) / (1024.0 * 1024.0 * 1024.0);
+        libre_gb = (double)(stat.f_bfree  * block_size) / (1024.0 * 1024.0 * 1024.0);
+        usado_gb = total_gb - libre_gb;
+        porcentaje_uso = (usado_gb / total_gb) * 100.0;
+ 
+        /* Nivel de alerta */
+        const char *nivel;
+        if (porcentaje_uso >= 90.0)      nivel = "ERROR";
+        else if (porcentaje_uso >= 75.0) nivel = "WARN";
+        else                              nivel = "INFO";
+ 
+        snprintf(mensaje, sizeof(mensaje),
+                 "Disco /: Total=%.2f GB | Usado=%.2f GB (%.1f%%) | Libre=%.2f GB",
+                 total_gb, usado_gb, porcentaje_uso, libre_gb);
+ 
+        escribir_log(nivel, "HILO-DISCO", mensaje);
+ 
+        suma_disco += porcentaje_uso;   /* NUEVO (100%) */
+        lecturas_validas++;             /* NUEVO (100%) */
+ 
+        sleep(INTERVALO_SEG);
+    }
+ 
+    /* NUEVO (100%): calcula y reporta el promedio de la sesión de este hilo */
+    {
+        double promedio = (lecturas_validas > 0) ? (suma_disco / lecturas_validas) : 0.0;
+        snprintf(mensaje, sizeof(mensaje),
+                 "Hilo DISCO finalizado correctamente. Promedio de sesion: %.2f%% (%d lecturas)",
+                 promedio, lecturas_validas);
+        escribir_log("INFO", "HILO-DISCO", mensaje);
+    }
+    pthread_exit(NULL);
+}
+ 
+/* ================================================================
+ *  FUNCIÓN PRINCIPAL
+ * ================================================================ */
+int main(void) {
+    pthread_t tid_cpu, tid_ram, tid_disco;
+    char timestamp[32];
+ 
+    /* NUEVO (65%): registrar el manejador para SIGTERM y SIGINT (Ctrl+C)
+       Esto permite que monitor.sh controle el cierre del binario C
+       enviando una señal en lugar de matarlo abruptamente con SIGKILL. */
+    struct sigaction sa;
+    sa.sa_handler = manejador_senales;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+ 
+    printf("==============================================\n");
+    printf("  MONITOR HW - Sistemas Operativos Fase 3\n");
+    printf("  Rojas Luna Kevin Jostin - 2023803011\n");
+    printf("  Avance 100%% -- %d iteraciones por hilo\n", ITERACIONES);
+    printf("==============================================\n\n");
+    printf("Nota: este proceso puede pausarse con SIGSTOP y\n");
+    printf("reanudarse con SIGCONT sin perder progreso (gestionado\n");
+    printf("por el kernel, sin necesidad de codigo adicional).\n\n");
+ 
+    /* Inicializar el archivo de log */
+    FILE *fp_init = fopen(LOG_FILE, "w");
+    if (fp_init == NULL) {
+        fprintf(stderr, "ERROR: No se puede crear el log en %s\n", LOG_FILE);
+        fprintf(stderr, "Asegúrate de que /dev/shm/ exista (Ubuntu lo tiene por defecto)\n");
+        return EXIT_FAILURE;
+    }
+    obtener_timestamp(timestamp, sizeof(timestamp));
+    fprintf(fp_init, "%s [INFO] [SISTEMA] ===== INICIO DE MONITOREO CONCURRENTE =====\n", timestamp);
+    fclose(fp_init);
+ 
+    printf("Log creado en: %s\n\n", LOG_FILE);
+    printf("Iniciando 3 hilos concurrentes...\n\n");
+ 
+    /* ── Crear los 3 hilos ───────────────────────────────── */
+    if (pthread_create(&tid_cpu, NULL, hilo_cpu, NULL) != 0) {
+        perror("Error creando hilo CPU");
+        return EXIT_FAILURE;
+    }
+ 
+    if (pthread_create(&tid_ram, NULL, hilo_ram, NULL) != 0) {
+        perror("Error creando hilo RAM");
+        return EXIT_FAILURE;
+    }
+ 
+    if (pthread_create(&tid_disco, NULL, hilo_disco, NULL) != 0) {
+        perror("Error creando hilo DISCO");
+        return EXIT_FAILURE;
+    }
+ 
+    /* ── Esperar a que todos los hilos terminen ──────────── */
+    pthread_join(tid_cpu,   NULL);
+    pthread_join(tid_ram,   NULL);
+    pthread_join(tid_disco, NULL);
+ 
+    /* ── Escribir fin de monitoreo ───────────────────────── */
+    escribir_log("INFO", "SISTEMA", "===== FIN DE MONITOREO CONCURRENTE =====");
+ 
+    /* Destruir el mutex */
+    pthread_mutex_destroy(&mutex_log);
+ 
+    printf("\n==============================================\n");
+    printf("  Monitoreo completado.\n");
+    printf("  Revisa el log en: %s\n", LOG_FILE);
+    printf("  Comando: cat %s\n", LOG_FILE);
+    printf("==============================================\n");
+ 
+    return EXIT_SUCCESS;
+}
